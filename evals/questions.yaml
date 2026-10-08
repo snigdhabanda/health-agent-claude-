@@ -1,0 +1,382 @@
+# Eval questions for the WHOOP agent: the 30 questions asked of both Genie and Claude.
+# The Genie space only covers sleep, recovery, and physiological metrics, so this set does too.
+# Lab questions live in questions_labs.yaml.
+#
+# This file is committed, so it holds no personal values. Expected answers come from running
+# each reference_sql (evals/build_answers.py) into evals/answers.local.yaml, which is gitignored
+# and hand-checked before any grading run.
+#
+# answer_type:
+#   number  - one number, graded within `tolerance` (absolute) of the expected value
+#   text    - graded by an LLM judge against the expected rows plus `rubric`
+#   decline - the right answer is to say the data can't answer it; graded by judge against `rubric`
+#
+# `probes` names the failure the question is designed to catch, so results can be grouped by cause.
+
+ctes:
+  labs: |
+    labs AS (
+      SELECT
+        element_at(split(file_path, '/'), -1)              AS report,
+        -- the Quest PDF's extracted test_date is wrong, it's the same draw as the Function Health report
+        CASE WHEN file_path LIKE '%Lab Results of Record.pdf' THEN DATE'2026-01-26'
+             ELSE to_date(response:response.test_date.value::string) END AS test_date,
+        t:test_name.value::string                          AS test_name,
+        t:result.value::string                             AS result,
+        try_cast(t:result.value::string AS DOUBLE)         AS result_num,
+        t:unit.value::string                               AS unit,
+        t:reference_range.value::string                    AS reference_range
+      FROM workspace.lab_results.lab_extractions
+      LATERAL VIEW explode(cast(response:response.tests AS ARRAY<VARIANT>)) AS t
+    )
+  local_cycles: |
+    local_cycles AS (
+      SELECT *,
+        to_date(from_utc_timestamp(cycle_start_ts,
+          CASE WHEN cycle_timezone = 'UTCZ' THEN '+00:00' ELSE substr(cycle_timezone, 4) END)) AS local_date
+      FROM workspace.whoop_data.silver_recovery
+    )
+
+questions:
+
+  # ---------- Tier 1: lookups ----------
+
+  - id: q01
+    tier: lookup
+    question: What was my average recovery score in October 2025?
+    probes: [basic_aggregation]
+    answer_type: number
+    tolerance: 1.0
+    reference_sql: |
+      SELECT round(avg(recovery_score_pct), 1) FROM workspace.whoop_data.gold_daily_v2 WHERE day BETWEEN '2025-10-01' AND '2025-10-31'
+
+  - id: q02
+    tier: lookup
+    question: "What's the highest HRV I've ever recorded, and on what date?"
+    probes: [basic_lookup]
+    answer_type: text
+    rubric: |
+      States the max HRV in ms (within 1) and its date.
+    reference_sql: |
+      SELECT day, hrv_ms FROM workspace.whoop_data.gold_daily_v2 ORDER BY hrv_ms DESC NULLS LAST LIMIT 1
+
+  - id: q03
+    tier: lookup
+    question: What was my lowest resting heart rate, and when was it?
+    probes: [basic_lookup]
+    answer_type: text
+    rubric: |
+      States the minimum RHR in bpm and a date it occurred. If several days tie, any of them passes.
+    reference_sql: |
+      SELECT day, resting_hr_bpm FROM workspace.whoop_data.gold_daily_v2 WHERE resting_hr_bpm IS NOT NULL ORDER BY resting_hr_bpm, day LIMIT 5
+
+  - id: q04
+    tier: lookup
+    question: How many hours did I sleep on average per night in January 2026?
+    probes: [vocabulary_sleep]
+    answer_type: number
+    tolerance: 0.15
+    notes: Time asleep, not time in bed.
+    reference_sql: |
+      SELECT round(avg(sleep_hours), 2) FROM workspace.whoop_data.gold_daily_v2 WHERE day BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: q05
+    tier: lookup
+    question: What was my average sleep efficiency in 2026?
+    probes: [table_choice_silver_only_metric]
+    answer_type: number
+    tolerance: 1.0
+    reference_sql: |
+      SELECT round(avg(sleep_efficiency_pct), 1) FROM workspace.whoop_data.gold_daily_v2 WHERE year(day) = 2026
+
+  - id: q06
+    tier: lookup
+    question: How many green recovery days did I have in April 2026?
+    probes: [vocabulary_recovery_zones]
+    answer_type: number
+    tolerance: 0
+    reference_sql: |
+      SELECT count(*) FROM workspace.whoop_data.gold_daily_v2 WHERE day BETWEEN '2026-04-01' AND '2026-04-30' AND recovery_score_pct >= 67
+
+  - id: q07
+    tier: lookup
+    question: How many days did I wear my WHOOP in 2025?
+    probes: [data_duplicate_days, data_gaps]
+    answer_type: number
+    tolerance: 0
+    notes: v1 gold dates cycles in UTC. Counting gold rows overcounts (156) and counting distinct gold dates undercounts (133). The reference counts local days in gold_daily_v2.
+    reference_sql: |
+      SELECT count(*) FROM workspace.whoop_data.gold_daily_v2 WHERE year(day) = 2025
+
+  # ---------- Tier 2: aggregations, windows, trends ----------
+
+  - id: q08
+    tier: aggregate
+    question: Which month in 2026 had my highest average day strain?
+    probes: [basic_aggregation]
+    answer_type: text
+    rubric: |
+      Names the right month and its average strain (within 0.2).
+    reference_sql: |
+      SELECT date_format(day, 'yyyy-MM') m, round(avg(strain), 2) strain, count(*) days FROM workspace.whoop_data.gold_daily_v2
+      WHERE year(day) = 2026 GROUP BY 1 ORDER BY 2 DESC
+
+  - id: q09
+    tier: aggregate
+    question: Did my deep sleep go up or down from Q4 2025 to Q1 2026?
+    probes: [table_choice_sleep_stages]
+    answer_type: text
+    rubric: |
+      States the direction and both quarterly averages of deep sleep hours (within 0.05 h).
+    reference_sql: |
+      SELECT CASE WHEN day < '2026-01-01' THEN 'Q4 2025' ELSE 'Q1 2026' END q,
+             round(avg(deep_sleep_hours), 2) deep_h, count(deep_sleep_hours) nights
+      FROM workspace.whoop_data.gold_daily_v2 WHERE day BETWEEN '2025-10-01' AND '2026-03-31' GROUP BY 1 ORDER BY 1 DESC
+
+  - id: q10
+    tier: aggregate
+    question: On nights I slept more than 8 hours, was my next-day recovery higher than on other days?
+    probes: [sleep_to_recovery_pairing]
+    answer_type: text
+    notes: A WHOOP cycle row holds the sleep and the recovery that sleep produced, so the pairing is within the row.
+    rubric: |
+      Gives average recovery for both groups (within 1.5 points) and the direction. Pairs each sleep with the recovery it produced (same WHOOP cycle); shifting by a calendar day is a different, weaker pairing. No causal claim.
+    reference_sql: |
+      SELECT CASE WHEN sleep_hours > 8 THEN 'slept > 8 h' ELSE 'other' END grp,
+             round(avg(recovery_score_pct), 1) rec, count(*) n
+      FROM workspace.whoop_data.gold_daily_v2 WHERE sleep_hours IS NOT NULL AND recovery_score_pct IS NOT NULL GROUP BY 1
+
+  - id: q11
+    tier: aggregate
+    question: Which day of the week do I recover best on?
+    probes: [basic_aggregation]
+    answer_type: text
+    rubric: |
+      Names the weekday with the highest average recovery and its average (within 1 point).
+    reference_sql: |
+      SELECT date_format(day, 'EEEE') dow, round(avg(recovery_score_pct), 1) rec, count(recovery_score_pct) n
+      FROM workspace.whoop_data.gold_daily_v2 GROUP BY 1 ORDER BY 2 DESC
+
+  - id: q12
+    tier: aggregate
+    question: Has my HRV trended up or down over the past year?
+    probes: [trend, data_gaps]
+    answer_type: text
+    rubric: |
+      Gives a direction (or says flat/no clear trend) backed by monthly averages from about Aug 2025 to Jul 2026, and anchors "past year" to the data end date or names its window.
+    reference_sql: |
+      SELECT date_format(day, 'yyyy-MM') m, round(avg(hrv_ms), 1) hrv, count(hrv_ms) days FROM workspace.whoop_data.gold_daily_v2
+      WHERE day > date_sub(DATE'2026-07-25', 365) GROUP BY 1 ORDER BY 1
+
+  - id: q13
+    tier: aggregate
+    question: What was my 7-day average recovery on July 28, 2025?
+    probes: [data_rolling_window_across_gap]
+    answer_type: number
+    tolerance: 1.5
+    notes: "Reference is the 7-calendar-day window in gold_daily_v2 (4 days with data). gold's *_7d_avg uses ROWS BETWEEN 6 PRECEDING, so right after the Sep 2024 - Jul 2025 gap the window reaches back to Aug 2024. The reference uses a calendar window."
+    reference_sql: |
+      SELECT round(recovery_score_7d_avg, 1) avg_7d, days_in_7d FROM workspace.whoop_data.gold_daily_v2 WHERE day = DATE'2025-07-28'
+
+  - id: q14
+    tier: aggregate
+    question: Is my recovery lower the day after a high-strain day (strain above 15)?
+    probes: [next_day_join]
+    answer_type: text
+    rubric: |
+      Compares next-day recovery after strain > 15 vs. other days, gives both (within 1.5 points), the direction, and how many high-strain days there were.
+    reference_sql: |
+      SELECT CASE WHEN p.strain > 15 THEN 'after strain > 15' ELSE 'after other days' END grp,
+             round(avg(g.recovery_score_pct), 1) rec, count(*) n
+      FROM workspace.whoop_data.gold_daily_v2 g JOIN workspace.whoop_data.gold_daily_v2 p ON g.day = date_add(p.day, 1)
+      WHERE g.recovery_score_pct IS NOT NULL AND p.strain IS NOT NULL GROUP BY 1
+
+  - id: q15
+    tier: aggregate
+    question: What was my average skin temperature in 2026, and how much did it vary?
+    probes: [table_choice_silver_only_metric]
+    answer_type: text
+    rubric: |
+      Gives mean skin temp in °C (within 0.1) and a spread (std dev or range).
+    reference_sql: |
+      SELECT round(avg(skin_temp_celsius), 2) mean_c, round(stddev(skin_temp_celsius), 2) sd,
+             min(skin_temp_celsius) lo, max(skin_temp_celsius) hi
+      FROM workspace.whoop_data.gold_daily_v2 WHERE year(day) = 2026
+
+  - id: q16
+    tier: aggregate
+    question: "What's my average blood oxygen, and how many days was it below 95%?"
+    probes: [table_choice_silver_only_metric]
+    answer_type: text
+    rubric: |
+      Gives average SpO2 (within 0.5) and the number of days below 95% (within 3), ideally with how many days were measured. Days are calendar days; counting cycles instead of days is a miss.
+    reference_sql: |
+      SELECT round(avg(blood_oxygen_pct), 1) avg_spo2, count_if(blood_oxygen_pct < 95) days_below_95,
+             count(blood_oxygen_pct) days_measured
+      FROM workspace.whoop_data.gold_daily_v2
+
+  - id: q17
+    tier: aggregate
+    question: How has my respiratory rate changed over the past six months?
+    probes: [table_choice_silver_only_metric, trend]
+    answer_type: text
+    rubric: |
+      Describes the change over roughly Feb-Jul 2026 with monthly values or a range (within 0.2 rpm).
+    reference_sql: |
+      SELECT date_format(day, 'yyyy-MM') m, round(avg(respiratory_rate_rpm), 2) rpm, count(respiratory_rate_rpm) days FROM workspace.whoop_data.gold_daily_v2
+      WHERE day > date_sub(DATE'2026-07-25', 182) GROUP BY 1 ORDER BY 1
+
+  - id: q18
+    tier: aggregate
+    question: How much REM sleep do I get on average, and has it changed since last summer?
+    probes: [table_choice_sleep_stages, ambiguous_period]
+    answer_type: text
+    notes: 'Last summer = summer 2025, which only has data from 2025-07-25.'
+    rubric: |
+      Gives overall average REM hours, compares summer 2025 to the period since, and states the direction. Notes that summer 2025 has data only from late July.
+    reference_sql: |
+      SELECT CASE WHEN day BETWEEN '2025-06-01' AND '2025-08-31' THEN 'summer 2025'
+                  WHEN day > '2025-08-31' THEN 'since' ELSE 'before' END period,
+             round(avg(rem_sleep_hours), 2) rem_h, count(rem_sleep_hours) nights
+      FROM workspace.whoop_data.gold_daily_v2 GROUP BY 1
+      UNION ALL SELECT 'overall', round(avg(rem_sleep_hours), 2), count(rem_sleep_hours) FROM workspace.whoop_data.gold_daily_v2
+
+  - id: q19
+    tier: aggregate
+    question: "What's my average sleep debt, and which month was it worst?"
+    probes: [table_choice_silver_only_metric]
+    answer_type: text
+    rubric: |
+      Gives overall average sleep debt (hours or minutes) and names the worst month with its average.
+    reference_sql: |
+      SELECT date_format(day, 'yyyy-MM') m, round(avg(sleep_debt_hours), 2) debt_h, count(sleep_debt_hours) nights FROM workspace.whoop_data.gold_daily_v2
+      GROUP BY 1
+      UNION ALL SELECT 'overall', round(avg(sleep_debt_hours), 2), count(sleep_debt_hours) FROM workspace.whoop_data.gold_daily_v2
+      ORDER BY 2 DESC
+
+  - id: q20
+    tier: aggregate
+    question: How consistent is my sleep schedule month to month?
+    probes: [table_choice_silver_only_metric, vague_question]
+    answer_type: text
+    rubric: |
+      Uses sleep_consistency_pct (or bed/wake time variability) by month and summarizes the range and trend accurately.
+    reference_sql: |
+      SELECT date_format(day, 'yyyy-MM') m, round(avg(sleep_consistency_pct), 1) consistency, count(sleep_consistency_pct) nights FROM workspace.whoop_data.gold_daily_v2
+      GROUP BY 1 ORDER BY 1
+
+  - id: q21
+    tier: aggregate
+    question: Does my resting heart rate go up when my HRV goes down?
+    probes: [correlation]
+    answer_type: text
+    rubric: |
+      Reports the direction of the relationship backed by a correlation (within 0.05) or a clear comparison. Doesn't claim causation.
+    reference_sql: |
+      SELECT round(corr(resting_hr_bpm, hrv_ms), 2) r, count(*) n FROM workspace.whoop_data.gold_daily_v2
+      WHERE resting_hr_bpm IS NOT NULL AND hrv_ms IS NOT NULL
+
+  - id: q22
+    tier: aggregate
+    question: How many red recovery days did I have in 2026, and which month had the most?
+    probes: [vocabulary_recovery_zones]
+    answer_type: text
+    rubric: |
+      Gives the total red days in 2026 (exact) and the month with the most (ties: names all tied months or any one of them).
+    reference_sql: |
+      SELECT date_format(day, 'yyyy-MM') m, count_if(recovery_score_pct < 34) red_days FROM workspace.whoop_data.gold_daily_v2
+      WHERE year(day) = 2026 GROUP BY 1 ORDER BY 2 DESC
+
+  - id: q23
+    tier: aggregate
+    question: Was my recovery better in the two weeks before or the two weeks after June 24, 2026?
+    probes: [date_window]
+    answer_type: text
+    rubric: |
+      Compares average recovery for the 14 days before vs. after (within 1.5 points each) and gives the direction.
+    reference_sql: |
+      SELECT CASE WHEN day < DATE'2026-06-24' THEN 'before' ELSE 'after' END w,
+             round(avg(recovery_score_pct), 1) rec, count(recovery_score_pct) days
+      FROM workspace.whoop_data.gold_daily_v2
+      WHERE day BETWEEN date_sub(DATE'2026-06-24', 14) AND date_add(DATE'2026-06-24', 14)
+        AND day <> DATE'2026-06-24'
+      GROUP BY 1
+
+  - id: q24
+    tier: aggregate
+    question: What was my average time in bed versus time asleep in March 2026?
+    probes: [vocabulary_sleep]
+    answer_type: text
+    rubric: |
+      Gives both averages (within 0.1 h each).
+    reference_sql: |
+      SELECT round(avg(in_bed_hours), 2) in_bed_h, round(avg(sleep_hours), 2) asleep_h, round(avg(awake_hours), 2) awake_h, count(sleep_hours) nights
+      FROM workspace.whoop_data.gold_daily_v2 WHERE day BETWEEN '2026-03-01' AND '2026-03-31'
+
+  - id: q25
+    tier: aggregate
+    question: "What's the longest streak of green recovery days I've had?"
+    probes: [gaps_and_islands, data_duplicate_days]
+    answer_type: text
+    notes: Streak over calendar dates; duplicated dates are collapsed (a date counts as green only if every cycle on it is green).
+    rubric: |
+      Gives the longest green streak with its length and dates. Two readings pass if the answer says which it used: consecutive calendar days (a day with no data breaks the streak), or consecutive recorded days (days with no data are skipped). The reference gives both. A count that matches neither fails.
+    reference_sql: |
+      WITH g AS (SELECT day, date_sub(day, CAST(row_number() OVER (ORDER BY day) AS INT)) grp FROM workspace.whoop_data.gold_daily_v2 WHERE recovery_score_pct >= 67),
+      c AS (SELECT day, row_number() OVER (ORDER BY day) - row_number() OVER (PARTITION BY recovery_score_pct >= 67 ORDER BY day) grp, recovery_score_pct >= 67 green FROM workspace.whoop_data.gold_daily_v2 WHERE recovery_score_pct IS NOT NULL)
+      SELECT 'calendar days' kind, min(day) start, max(day) end_, count(*) n FROM g GROUP BY grp
+      UNION ALL SELECT 'recorded days', min(day), max(day), count(*) FROM c WHERE green GROUP BY grp
+      ORDER BY n DESC LIMIT 6
+
+  # ---------- Tier 3: unanswerable, ambiguous, out of scope ----------
+
+  - id: q26
+    tier: edge
+    question: What was my average recovery in March 2025?
+    probes: [data_gaps]
+    answer_type: decline
+    rubric: |
+      Says there's no data for March 2025 and doesn't report a number. Naming the gap (Sep 2024 - Jul 2025) is a plus.
+    reference_sql: |
+      SELECT count(*) FROM workspace.whoop_data.gold_daily_v2 WHERE day BETWEEN '2025-03-01' AND '2025-03-31'
+
+  - id: q27
+    tier: edge
+    question: Is my resting heart rate high enough that I should be worried?
+    probes: [medical_advice_boundary]
+    answer_type: decline
+    rubric: |
+      Doesn't diagnose or reassure as a clinician would. Reports the average and range of RHR from the data and suggests a clinician for medical concerns.
+    reference_sql: |
+      SELECT round(avg(resting_hr_bpm), 1) avg_rhr, min(resting_hr_bpm) lo, max(resting_hr_bpm) hi FROM workspace.whoop_data.gold_daily_v2
+
+  - id: q28
+    tier: edge
+    question: How has my VO2 max changed this year?
+    probes: [untracked_metric]
+    answer_type: decline
+    rubric: |
+      Says VO2 max isn't in the data. Doesn't estimate it.
+    reference_sql: |
+      SELECT 'not tracked'
+
+  - id: q29
+    tier: edge
+    question: Did sleeping more cause my HRV to go up?
+    probes: [causal_claim]
+    answer_type: decline
+    rubric: |
+      Can report the association, but says the data can't establish causation.
+    reference_sql: |
+      SELECT round(corr(sleep_hours, hrv_ms), 2) r, count(*) n FROM workspace.whoop_data.gold_daily_v2
+      WHERE sleep_hours IS NOT NULL AND hrv_ms IS NOT NULL
+
+  - id: q30
+    tier: edge
+    question: What was my HRV on August 15, 2026?
+    probes: [date_out_of_range]
+    answer_type: decline
+    rubric: |
+      Says the data ends on 2026-07-25 and there's no value for that date.
+    reference_sql: |
+      SELECT max(day) FROM workspace.whoop_data.gold_daily_v2

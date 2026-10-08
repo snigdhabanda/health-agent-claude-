@@ -1,0 +1,20 @@
+# secrets
+.env
+
+# personal health data — never commit
+data/
+*.pdf
+*.csv
+*.duckdb
+
+# eval run artifacts (raw transcripts may contain personal data)
+evals/runs/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# expected answers hold real health values — hand-checked locally, never committed
+evals/*.local.yaml

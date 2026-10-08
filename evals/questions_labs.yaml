@@ -1,0 +1,148 @@
+# Lab questions for the Claude-only lab experiment (prompt vs. tool vs. data-layer fix).
+# The Genie space has no lab table, so these aren't part of the Genie comparison.
+# Same format as questions.yaml; ctes are defined there.
+
+questions:
+  - id: L01
+    tier: labs
+    question: How many blood draws have I had, and when?
+    probes: [labs_variant_flattening, labs_same_draw_two_reports]
+    answer_type: text
+    notes: The Quest report and the Function Health dashboard are the same draw (2026-01-26).
+    rubric: Says 2 draws, on 2026-01-26 and 2026-06-24. Saying 3 fails, unless it explains that 3 reports cover 2 draws.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_date, collect_set(report) reports FROM labs GROUP BY 1 ORDER BY 1
+
+  - id: L02
+    tier: labs
+    question: Which tests were out of range in my most recent lab report?
+    probes: [labs_numeric_ranges]
+    answer_type: text
+    notes: |
+      The most recent report gives ranges as text ("3-40 U/L", "<150 mg/dL"), not flags, so the
+      agent has to compare result to range itself. Hand-check the expected list in answers.local.yaml.
+    rubric: Lists exactly the out-of-range tests in the expected answer, no extras, no misses. Says when a range was unreadable.
+    reference_sql: |
+      WITH {labs},
+      latest AS (SELECT * FROM labs WHERE test_date = (SELECT max(test_date) FROM labs)),
+      parsed AS (
+        SELECT *,
+          CASE
+            WHEN reference_range RLIKE '^[0-9.]+-[0-9.]+' THEN try_cast(regexp_extract(reference_range, '^([0-9.]+)-', 1) AS DOUBLE) END lo,
+          CASE
+            WHEN reference_range RLIKE '^[0-9.]+-[0-9.]+' THEN try_cast(regexp_extract(reference_range, '^[0-9.]+-([0-9.]+)', 1) AS DOUBLE)
+            WHEN reference_range RLIKE '^(<|< ?OR ?= ?)' THEN try_cast(regexp_extract(reference_range, '([0-9.]+)', 1) AS DOUBLE) END hi,
+          CASE
+            WHEN reference_range RLIKE '^(>|> ?OR ?= ?)' THEN try_cast(regexp_extract(reference_range, '([0-9.]+)', 1) AS DOUBLE) END lo_only
+        FROM latest
+      )
+      SELECT test_name, result, unit, reference_range,
+        CASE WHEN result_num IS NULL OR (lo IS NULL AND hi IS NULL AND lo_only IS NULL) THEN 'unparsed'
+             WHEN result_num < coalesce(lo, lo_only, -1e9) THEN 'LOW'
+             WHEN result_num > coalesce(hi, 1e9) THEN 'HIGH' ELSE 'ok' END status
+      FROM parsed ORDER BY status, test_name
+
+  - id: L03
+    tier: labs
+    question: Which tests were flagged on my Function Health dashboard?
+    probes: [labs_categorical_flags]
+    answer_type: text
+    rubric: Lists the tests whose reference_range is Above Range, Below Range, or Out of Range, with the direction.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_name, result, unit, reference_range FROM labs
+      WHERE report LIKE 'Data – Function%' AND reference_range IN ('Above Range', 'Below Range', 'Out of Range')
+      ORDER BY reference_range, test_name
+
+  - id: L04
+    tier: labs
+    question: How did my LDL cholesterol change between my first and most recent blood test?
+    probes: [labs_name_variants]
+    answer_type: text
+    notes: |
+      Names are "LDL-CHOLESTEROL" (Quest, Jan 26 and Jun 24) and "LDL-Cholesterol" (Function, Jan 26).
+      The two January rows are the same draw, re-reported, so there are two tests: 2026-01-26 and 2026-06-24.
+    rubric: Gives the Jan 26 and Jun 24 LDL values and the change. Counting the two January rows as separate tests fails.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_date, report, test_name, result, unit FROM labs
+      WHERE test_name ILIKE 'LDL%CHOLESTEROL%' ORDER BY test_date
+
+  - id: L05
+    tier: labs
+    question: What has my TSH been across all my lab reports?
+    probes: [labs_name_variants]
+    answer_type: text
+    notes: '"TSH" (Jun 24) vs "Thyroid-Stimulating Hormone (TSH)" (Function report, Jan 26 draw). Not in the Quest PDF.'
+    rubric: Gives both TSH values, January and June. Doesn't invent a third. The January value is dated 2026-01-26.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_date, test_name, result, unit, reference_range FROM labs
+      WHERE test_name ILIKE '%TSH%' OR test_name ILIKE '%thyroid-stimulating%' ORDER BY test_date
+
+  - id: L06
+    tier: labs
+    question: What's my HbA1c trend?
+    probes: [labs_name_variants, vocabulary_abbreviation]
+    answer_type: text
+    notes: '"HEMOGLOBIN A1c" vs "Hemoglobin A1c (HbA1c)". Searching only for "HbA1c" misses the Jun 24 value.'
+    rubric: Gives the January and June HbA1c values and the direction. Notes that two points are a thin trend.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_date, test_name, result, unit FROM labs
+      WHERE test_name ILIKE '%A1c%' ORDER BY test_date
+
+  - id: L07
+    tier: labs_join
+    question: What was my average HRV in the 30 days before each blood draw?
+    probes: [join_labs_to_daily_window, labs_same_draw_two_reports]
+    answer_type: text
+    rubric: One average HRV (within 1 ms) for each of the 2 draws (Jan 26, Jun 24), over the 30 days before it, with how many days had data.
+    reference_sql: |
+      WITH {labs},
+      d AS (SELECT DISTINCT test_date FROM labs)
+      SELECT d.test_date, round(avg(g.hrv_ms), 1) hrv_30d, count(g.hrv_ms) days
+      FROM d LEFT JOIN workspace.whoop_data.gold_daily_metrics g
+        ON g.cycle_date >= date_sub(d.test_date, 30) AND g.cycle_date < d.test_date
+      GROUP BY 1 ORDER BY 1
+
+  - id: L08
+    tier: labs_join
+    question: Was my recovery better in the two weeks before or the two weeks after my June 2026 blood draw?
+    probes: [join_labs_to_daily_window]
+    answer_type: text
+    rubric: Compares average recovery for the 14 days before vs. the 14 days after 2026-06-24 (within 1 point each) and gives the direction.
+    reference_sql: |
+      SELECT CASE WHEN cycle_date < DATE'2026-06-24' THEN 'before' ELSE 'after' END w,
+             round(avg(recovery_score_pct), 1) rec, count(*) days
+      FROM workspace.whoop_data.gold_daily_metrics
+      WHERE cycle_date BETWEEN date_sub(DATE'2026-06-24', 14) AND date_add(DATE'2026-06-24', 14)
+        AND cycle_date <> DATE'2026-06-24'
+      GROUP BY 1
+
+  - id: L09
+    tier: labs
+    question: What was my ferritin and was it in range?
+    probes: [labs_single_report_test]
+    answer_type: text
+    rubric: Gives the ferritin value, unit, date, and its range flag. Says it was only measured once.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_date, report, test_name, result, unit, reference_range FROM labs
+      WHERE test_name ILIKE '%ferritin%'
+
+  - id: L10
+    tier: labs
+    question: What was my albumin in January?
+    probes: [labs_ambiguous_name]
+    answer_type: text
+    notes: The Jan 26 report has both blood "Albumin" and "Albumin (Microalbumin - Urine)".
+    rubric: Reports blood albumin, and either excludes urine microalbumin or reports it separately as a different test. Mixing them up fails.
+    reference_sql: |
+      WITH {labs}
+      SELECT test_date, test_name, result, unit, reference_range FROM labs
+      WHERE test_name ILIKE '%albumin%' AND month(test_date) = 1 ORDER BY test_name
+
+  # ---------- Tier 4: unanswerable, ambiguous, out of scope ----------
+

@@ -1,0 +1,5 @@
+anthropic
+certifi
+duckdb
+python-dotenv
+pyyaml

@@ -2,7 +2,7 @@
 
 This is v2 of [health-lakehouse-agent](https://github.com/snigdhabanda/health-lakehouse-agent-). In v1 I built a lakehouse on Databricks for two years of WHOOP biometrics and my blood-lab PDFs, then put a Genie agent on top of it. In v2 I replaced Genie with a small Claude agent querying the same tables, built a 30-question eval to measure both, and used the eval to test a claim I made in v1.
 
-**The short version:** the eval turned up two date bugs in my v1 gold table. Every agent got those questions wrong, Genie and Claude Opus included. Fixing the data took Claude Sonnet from 47% to 90% correct. That beats Opus on the buggy data (53%) at about a quarter of the cost per question.
+**The short version:** the eval turned up two date bugs in my v1 gold table. Every agent got those questions wrong, Genie and Claude Opus included. Fixing the data took Claude Sonnet from 47% to 90% correct, and Genie from 47% to 67%. Sonnet on the fixed data beats Opus on the buggy data (53%) at about a quarter of the cost per question.
 
 - [Part 1: The Databricks build (v1)](#part-1-the-databricks-build-v1)
 - [Part 2: Swapping Genie for Claude](#part-2-swapping-genie-for-claude)
@@ -75,16 +75,21 @@ flowchart LR
         CSV["WHOOP CSV export"] --> B["bronze"] --> S["silver"] --> G1["gold_daily_metrics<br/>(v1)"]
         S --> G2["gold_daily_v2<br/>(view, v2 fix)"]
         PDF["Lab PDFs"] --> AB["Agent Bricks"] --> LAB["lab_extractions"]
+        MCP["Managed SQL MCP server<br/>/api/2.0/mcp/sql"]
+        SQLAPI["SQL Statement API"]
+        MCP --> G1 & G2
+        SQLAPI --> G1 & G2
     end
 
     GENIE["Genie space<br/>(managed model)"] -->|SQL| G1
     GENIE -.->|re-test| G2
 
     subgraph AGENT["Claude agent (agent.py)"]
-        API["Claude API"] <-->|tool call / rows| TOOL["run_sql tool<br/>read-only · 200-row cap<br/>errors returned to Claude"]
+        API["Claude API<br/>+ MCP connector"]
+        TOOL["run_sql (db.py)<br/>original hand-built tool<br/>--tools run_sql"]
     end
-    TOOL -->|SQL Statement API| G1
-    TOOL -->|SQL Statement API| G2
+    API -->|"default: execute_sql_read_only,<br/>poll_sql_result (allowlist)"| MCP
+    API -.->|tool call / rows| TOOL -.-> SQLAPI
 
     subgraph EVAL["Eval harness (evals/)"]
         Q["30 questions"] --> REF["reference SQL<br/>→ expected answers"]
@@ -96,11 +101,37 @@ flowchart LR
     API --> ANS
 ```
 
-**How the agent works.** [`agent.py`](agent.py) is a short tool-use loop on the Claude API with one tool, `run_sql`. Claude never touches Databricks directly. For each question it writes SQL, my code runs it, and Claude reads the rows. Then it either answers or writes another query. A typical question takes 1–3 queries.
+**How the agent works.** [`agent.py`](agent.py) sends each question to the Claude API with my system prompt and a SQL tool. Claude never has the data. It writes SQL, the tool runs it against Databricks, and Claude reads the rows. Then it either answers or writes another query. A typical question takes 1–3 queries.
 
-- [`db.py`](db.py) runs the SQL through Databricks' SQL Statement Execution API, against the same tables Genie queries. It accepts only one read-only `SELECT` per call and caps results at 200 rows, so Claude has to aggregate in SQL instead of pulling raw days. SQL errors go back to Claude so it can fix its own query.
 - [`system_prompt.md`](system_prompt.md) carries over my Genie instructions (the vocabulary above) plus the table schemas.
 - Every answer is logged with the SQL that produced it, the token counts, the cost, and the latency. With Genie, I could only see the final answer.
+
+**The SQL tool is Databricks' own MCP server.** My Databricks workspace exposes a managed MCP server for SQL at `/api/2.0/mcp/sql`. The Claude API's MCP connector connects to it directly: I pass the server URL and a Databricks token in the request, Anthropic's servers open the connection, and the tool calls come back already resolved. There's no tool code of mine in the loop.
+
+The server offers three tools, and one of them can write, so the toolset runs in allowlist mode with everything off by default:
+
+| MCP tool | What it does | Enabled |
+|---|---|---|
+| `execute_sql_read_only` | `SELECT`, `SHOW`, `DESCRIBE` | ✅ |
+| `poll_sql_result` | Fetches results of a query that didn't finish inline | ✅ |
+| `execute_sql` | Any SQL, including writes (flagged destructive) | ❌ |
+
+I checked what Claude actually sees: only the two enabled tools.
+
+**I started with a hand-built tool, and kept it.** Before switching to MCP, I wrote my own SQL tool, `run_sql` ([`db.py`](db.py)). It's still available with `--tools run_sql`, because it's the tool that produced every result in Part 5, and those runs should stay reproducible. Comparing the two:
+
+| | Hand-built `run_sql` | Databricks MCP server |
+|---|---|---|
+| Code I own | Read-only checks, a 200-row cap, error formatting | None |
+| Read-only enforced by | My SQL check, plus token permissions | The server's read-only tool, plus token permissions |
+| Row cap | 200, so Claude has to aggregate in SQL | None from me; large results cost more tokens |
+| Where the Databricks token goes | Stays on my machine | Sent to Anthropic with each request, so its servers can connect |
+| Slow queries | My tool waits for the result | The server returns a statement ID, and Claude polls for it |
+| First test (one question, Sonnet) | about 9s typical | 32.7s, with one poll; correct answer |
+
+The MCP path is less code and uses the platform's own access controls, which is what I'd ship. The cost is giving up my row cap and sending the token to Anthropic. The second point is a good reason to use a read-only Databricks token, and nothing broader.
+
+I haven't re-run the eval on the MCP path yet. The open question is whether it changes accuracy or just latency.
 
 The point of rebuilding the agent was control, not a smarter model. Owning the loop means I can change the model, change what the agent is told about the data, and measure the effect of each change.
 
@@ -173,7 +204,7 @@ These aren't part of the 30-question eval yet:
 
 ## Part 5: Results
 
-All configs were graded against references from `gold_daily_v2`, the corrected definition of a day.
+All configs were graded against references from `gold_daily_v2`, the corrected definition of a day. The Claude runs used the hand-built `run_sql` tool (see Part 2).
 
 ### Baseline: every agent on the v1 data
 
@@ -195,11 +226,20 @@ Two ways to fix the same failures, on the same model (Sonnet) and the same quest
 | Sonnet, v1 data (baseline) | 14/30 (47%) | 5 | $0.018 | 9.6s |
 | **B. Prompt fix:** v1 tables, bugs explained in the prompt | 26/30 (87%) | 0 | $0.021 | 11.7s |
 | **C. Data fix:** `gold_daily_v2` | **27/30 (90%)** | **0** | **$0.017** | **8.7s** |
-| Genie, `gold_daily_v2` | *re-test in progress* | | | |
+| Genie, v1 data (baseline) | 14/30 (47%) | 9 | – | – |
+| **Genie, `gold_daily_v2`** | **20/30 (67%)** | 7 | – | – |
 
 - **Both fixes work, and neither leaves an outright fail.** The remaining misses are partials on rubric details, for example not mentioning that "last summer" only has data from late July.
 - **The data fix is the better one.** It scored about the same as the prompt fix, at about 20% lower cost and 25% lower latency, with a shorter prompt. It also fixes the problem for every consumer: Claude, Genie, and my dashboards. The prompt fix only works because the eval found the bugs first, and every query still has to apply the local-date logic correctly.
 - **Fixing the data beat upgrading the model.** Sonnet on `gold_daily_v2` (90%, $0.017/question) beats Opus on v1 (53%, $0.062/question).
+- **The data fix helped Genie too, with no change to Genie.** I pointed my Genie space at `gold_daily_v2` and re-asked the 30 questions. It went from 47% to 67%, and every question touching the date bugs now passes: green days, days worn, the 7-day average, and the high-strain comparison. Genie's remaining misses are reasoning, not data:
+  - It paired each night's sleep with the wrong day's recovery.
+  - It read "last summer" as summer 2026.
+  - It answered "month to month" with a single average, and summarized a year-long HRV trend from two endpoints.
+  - It reported 80 red days when there were 8.
+  - It called my resting heart rate "normal range".
+
+  Once the data is right, the agent on top starts to matter. On the same clean view, the Claude agent scored 90% to Genie's 67%.
 
 So the v1 claim holds, and now there's a measurement behind it: the fix was one layer down. What I got wrong in v1 was which layer. I'd assumed my gold table was correct.
 
@@ -210,16 +250,16 @@ Full per-question results: [`evals/results.md`](evals/results.md).
 ## Tradeoffs
 
 - **Genie is zero-setup but hard to inspect.** I wrote no code for it, but I couldn't choose the model, see its SQL across a batch, or run it on a schedule against fixed questions. I collected its answers by hand.
-- **Owning the agent means owning the guardrails.** The agent and its SQL tool are about 280 lines of Python. In exchange, I write and maintain the read-only checks, row caps, and error handling that Genie handles for me.
+- **Owning the agent means choosing where the guardrails live.** With my hand-built tool I wrote and maintained the read-only checks, row cap, and error handling myself. With Databricks' MCP server, those come from the platform, and my code shrinks to the agent loop. The cost is a token sent to Anthropic and no row cap.
 - **Model choice is a cost decision you can measure.** Opus costs about 3.5× Sonnet per question. On the v1 data it bought 2 more correct answers. On clean data Sonnet reached 90%, and the eval can tell me whether Haiku is enough.
-- **One tool, on purpose.** I didn't add tools I couldn't tie to a failure. More tools mean more ways to pick the wrong one, so each tool should earn its place in the eval. A dedicated `get_lab_window` tool is the next candidate, for the lab questions.
+- **One SQL tool, on purpose.** I didn't add tools I couldn't tie to a failure. More tools mean more ways to pick the wrong one, so each tool should earn its place in the eval. A dedicated `get_lab_window` tool is the next candidate, for the lab questions.
 
 ## Caveats
 
 - **Preliminary.** I'm still hand-checking the reference answers.
 - **Small sample.** It's one run per config and 30 questions, so a one-question difference (like B vs. C) is noise.
 - **Arm C is graded on its own definition.** Its references come from the same view it queries, so it answers by the same definition of a day it's graded on. Arm B is the check on that: it reached 87% on the v1 tables by deriving local dates itself.
-- **Genie answered in one batch.** It answered all 30 questions in a single response, while Claude answered each in its own conversation.
+- **Genie answered in one batch.** Both times it answered all 30 questions in a single response, the second time as a terse summary table, while Claude answered each in its own conversation. The table format cost Genie some partial credit for missing details, such as dates for the streak or the count of high-strain days.
 - **The same family grades its own answers.** The judge is a Claude model grading Claude answers. I reviewed its verdicts by hand, and the rubrics are specific to limit bias, but a human-graded subset would be stronger.
 
 ## What I'd build next
@@ -228,19 +268,23 @@ Full per-question results: [`evals/results.md`](evals/results.md).
 - **Claude vs. Agent Bricks on extraction.** Score both against the PDFs, field by field.
 - **Fix it upstream.** Move the date fix into the silver layer as a Lakeflow declarative pipeline with Auto Loader, so new exports land correctly. The v2 view exists separately only so v1 stays intact as the baseline.
 - **Haiku on clean data**, to see whether the cheapest model holds up.
+- **Re-run the eval on the MCP path**, to see whether switching from `run_sql` to Databricks' MCP server changes accuracy, cost, or only latency.
 
 ## Running it
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env    # Databricks host, warehouse HTTP path, read-only token; Anthropic API key
+                        # (the agent uses the workspace's managed SQL MCP server at /api/2.0/mcp/sql)
 
 python agent.py "What was my 7-day average recovery on July 28, 2025?"
 python agent.py --prompt prompts/system_prompt_c_v2.md "..."   # query gold_daily_v2
+python agent.py --tools run_sql "..."                          # the hand-built tool instead of the MCP server
 
 python sql/apply.py sql/gold_daily_v2.sql   # create the v2 view
 python evals/build_answers.py               # run reference SQL → evals/answers.local.yaml (gitignored)
 python evals/run_evals.py                   # Genie + Haiku/Sonnet/Opus, grade, write evals/results.md
+python evals/run_evals.py --tools run_sql    # reproduce the published runs with the hand-built tool
 python evals/run_evals.py --models claude-sonnet-5-5 --no-genie \
   --prompt prompts/system_prompt_c_v2.md --label "+C data layer"
 python evals/run_evals.py --regrade evals/runs/<run>   # re-grade saved answers
